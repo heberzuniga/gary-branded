@@ -1,0 +1,10 @@
+streamlit==1.37.1
+pandas==2.2.2
+numpy==1.26.4
+scikit-learn==1.4.2
+plotly==5.23.0
+statsmodels==0.14.2
+openpyxl==3.1.5
+xgboost==2.0.3
+lightgbm==4.3.0
+catboost==1.2.5
