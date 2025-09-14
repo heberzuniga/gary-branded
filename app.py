@@ -89,12 +89,17 @@ def add_calendar(df, date_col):
     return d
 
 def add_lags_rolls(df, target, lags, rolls):
-    d=df.copy()
-    for L in lags: d[f"{target}_lag{L}"]=d[target].shift(L)
+    d = df.copy()
+    # Coerción robusta del objetivo a numérico (quita símbolos, comas, espacios)
+    ser = d[target].astype(str).str.replace(r'[^0-9,\.\-]', '', regex=True).str.replace(',', '', regex=False)
+    d[target] = pd.to_numeric(ser, errors='coerce')
+    for L in lags:
+        d[f"{target}_lag{L}"] = d[target].shift(L)
     for R in rolls:
-        d[f"{target}_rollmean{R}"]=d[target].rolling(R).mean()
-        d[f"{target}_rollstd{R}"]=d[target].rolling(R).std()
-    return d.dropna()
+        if R < len(d):
+            d[f"{target}_rollmean{R}"] = d[target].rolling(R, min_periods=max(1, R//2)).mean()
+            d[f"{target}_rollstd{R}"] = d[target].rolling(R, min_periods=max(2, R//2)).std()
+    return d.dropna(subset=[target])
 
 def numeric_features(df, cols): return [c for c in cols if pd.api.types.is_numeric_dtype(df[c])]
 
@@ -199,8 +204,15 @@ elif PAGE.startswith("3"):
     else:
         lags=st.multiselect("Lags", [1,2,3,6,9,12,18,24], default=[1,2,3,6,12])
         rolls=st.multiselect("Ventanas móviles", [3,6,12,24], default=[3,6,12])
-        d=df.copy(); d[dc]=pd.to_datetime(d[dc]); d=d.sort_values(dc); d=add_calendar(d,dc); d=add_lags_rolls(d,tg,lags,rolls).dropna()
-        st.session_state["engineered"]=d.copy(); st.write(d.head())
+        d=df.copy(); d[dc]=pd.to_datetime(d[dc]); d=d.sort_values(dc); d=add_calendar(d,dc)
+        # sanity: convertir objetivo a numérico de manera segura
+        ser = d[tg].astype(str).str.replace(r'[^0-9,\.\-]', '', regex=True).str.replace(',', '', regex=False)
+        d[tg] = pd.to_numeric(ser, errors='coerce')
+        if d[tg].notna().sum() == 0:
+            st.error("La columna objetivo no contiene valores numéricos válidos después de la conversión. Revisa la selección de objetivo o el formato (símbolos/ comas).")
+        else:
+            d = add_lags_rolls(d,tg,lags,rolls).dropna()
+            st.session_state["engineered"]=d.copy(); st.write(d.head())
         st.download_button("Descargar CSV ingenierizado", d.to_csv(index=False).encode("utf-8"), "datos_ingenierizados.csv")
 
 elif PAGE.startswith("4"):
