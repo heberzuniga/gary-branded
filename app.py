@@ -1,5 +1,5 @@
 
-import os
+import os, json
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -36,6 +36,7 @@ def inject_css():
       h1,h2,h3,h4,h5,h6 {{ color:{fg}; }}
       .stButton button, .stDownloadButton button {{ background:{b['primary_hex']}; color:white; border-radius:8px; }}
       a {{ color:{b['accent_hex']}; }}
+      .badge {{ display:inline-block; padding:2px 8px; border-radius:12px; background:{b['accent_hex']}; color:white; font-size:11px; }}
     </style>
     """, unsafe_allow_html=True)
 
@@ -62,6 +63,37 @@ with st.sidebar:
         "7) Benchmark","8) Cobertura","9) Reporte","ℹ️ Glosario"
     ])
 
+    st.markdown("---")
+    st.subheader("🧭 Perfil de unidades")
+    if "units_profile" not in st.session_state:
+        st.session_state["units_profile"] = {"percent_cols": [], "percent_0_100": True, "currency_cols": [], "index_cols": []}
+    prof = st.session_state["units_profile"]
+
+    # Los selects se habilitan cuando hay datos cargados
+    data_cols = list(st.session_state.get("data", pd.DataFrame()).columns) if "data" in st.session_state else []
+    if data_cols:
+        prof["percent_cols"] = st.multiselect("Columnas en % (ratios)", prof.get("percent_cols", []), default=prof.get("percent_cols", []), options=data_cols, help="Ej: stock/consumo, participación, tasas.")
+        prof["percent_0_100"] = st.checkbox("Esquema % en 0–100 (no 0–1)", value=prof.get("percent_0_100", True))
+        prof["currency_cols"] = st.multiselect("Columnas en moneda (USD)", prof.get("currency_cols", []), default=prof.get("currency_cols", []), options=data_cols, help="Ej: precio_soya, costos en USD.")
+        prof["index_cols"] = st.multiselect("Columnas índice (base=100)", prof.get("index_cols", []), default=prof.get("index_cols", []), options=data_cols)
+
+        c1, c2 = st.columns(2)
+        with c1:
+            if st.button("💾 Guardar perfil (JSON)"):
+                st.session_state["units_profile"] = prof
+                st.session_state["units_profile_json"] = json.dumps(prof, ensure_ascii=False, indent=2)
+        with c2:
+            up_prof = st.file_uploader("📤 Cargar perfil (JSON)", type=["json"], key="profile_upload")
+            if up_prof is not None:
+                try:
+                    loaded = json.loads(up_prof.read().decode("utf-8"))
+                    st.session_state["units_profile"] = loaded
+                    st.success("Perfil cargado.")
+                except Exception as e:
+                    st.error(f"No se pudo cargar el perfil: {e}")
+    else:
+        st.info("Carga datos para definir el perfil de unidades.")
+
 if logo is not None:
     st.sidebar.image(logo, caption=st.session_state["brand"]["org"], use_column_width=True)
 else:
@@ -82,18 +114,20 @@ def parse_date(df)->Optional[str]:
         except: pass
     return None
 
+def try_parse_dates_series(s: pd.Series, dayfirst=False):
+    return pd.to_datetime(s.astype(str).str.strip(), errors='coerce', infer_datetime_format=True, dayfirst=dayfirst, utc=False)
+
 def robust_to_datetime(df, col):
-    """Convert a date-like column to pandas datetime handling mixed formats."""
     s = df[col].astype(str).str.strip()
-    dt1 = pd.to_datetime(s, errors='coerce', infer_datetime_format=True, utc=False)
+    dt1 = try_parse_dates_series(s, dayfirst=False)
     if dt1.isna().mean() > 0.3:
-        dt2 = pd.to_datetime(s, errors='coerce', dayfirst=True, infer_datetime_format=True, utc=False)
+        dt2 = try_parse_dates_series(s, dayfirst=True)
         dt = dt2
         if dt.isna().mean() > 0.3:
             s2 = s.str.replace('/', '-', regex=False)
-            dt3 = pd.to_datetime(s2, errors='coerce', infer_datetime_format=True, utc=False)
+            dt3 = try_parse_dates_series(s2, dayfirst=False)
             if dt3.isna().mean() > 0.3:
-                dt4 = pd.to_datetime(s2, errors='coerce', dayfirst=True, infer_datetime_format=True, utc=False)
+                dt4 = try_parse_dates_series(s2, dayfirst=True)
                 dt = dt4
             else:
                 dt = dt3
@@ -101,11 +135,18 @@ def robust_to_datetime(df, col):
         dt = dt1
     out = df.copy()
     out[col] = dt
-    n_bad = int(out[col].isna().sum())
-    if n_bad > 0:
-        st.warning(f"Se detectaron {n_bad} filas con fechas inválidas en '{col}'. Serán omitidas para el análisis.")
-        out = out.loc[out[col].notna()].copy()
     return out
+
+def invalid_date_rows(df, col):
+    """Return rows whose date in `col` stays NaT after robust parsing, plus the original value for inspection."""
+    orig = df.copy()
+    parsed = robust_to_datetime(df, col)
+    bad_mask = parsed[col].isna()
+    bad = orig.loc[bad_mask, [col]].copy()
+    bad.columns = [f"{col}_original"]
+    # add row index for reference
+    bad = bad.reset_index().rename(columns={"index": "row_idx"})
+    return bad
 
 def add_calendar(df, date_col):
     d=df.copy(); d[date_col]=pd.to_datetime(d[date_col])
@@ -168,10 +209,7 @@ def walk_forward(df, date_col, target, feats, model, initial, step):
 
 def to_percent_series(s, assume_0_to_1=True):
     s = pd.to_numeric(s, errors="coerce")
-    if assume_0_to_1:
-        return s
-    else:
-        return s/100.0
+    return s if assume_0_to_1 else s/100.0
 
 def normalize_base_100(df, cols, base_idx=0):
     out = df.copy()
@@ -204,6 +242,17 @@ elif PAGE.startswith("1"):
         target=st.selectbox("Objetivo (precio)", [""]+[c for c in df.columns if c!=date_col])
         feats=st.multiselect("Features (opcionales)", [c for c in df.columns if c not in [date_col,target]])
         freq=st.selectbox("Frecuencia", ["D","W","MS","M","Q","YS"], index=2)
+
+        # --- Diagnóstico de fechas inválidas ---
+        if date_col:
+            inv = invalid_date_rows(df, date_col)
+            n_bad = len(inv)
+            if n_bad > 0:
+                st.warning(f"Se detectaron {n_bad} filas con fechas inválidas en '{date_col}'.")
+                with st.expander("Ver filas con fecha inválida"):
+                    st.dataframe(inv.head(200), use_container_width=True)
+                    st.download_button("Descargar CSV con filas inválidas", inv.to_csv(index=False).encode("utf-8"), "fechas_invalidas.csv")
+
         if st.button("Guardar"):
             st.session_state.update({"date_col":date_col,"target":target,"features":feats,"freq":freq})
             st.success("Configuración guardada.")
@@ -219,21 +268,26 @@ elif PAGE.startswith("2"):
         # ---- Configuración ----
         x=st.selectbox("Eje X", list(df.columns))
         ys=st.multiselect("Series a graficar (Y)", [c for c in df.columns if c != x], default=[c for c in df.columns if c != x][:1])
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            use_dual = st.checkbox("Eje secundario automático", value=True, help="Si las escalas difieren mucho, usa un segundo eje Y.")
-        with c2:
-            is_percent_cols = st.multiselect("Tratar como %", ys, help="Se formatean como porcentaje. Si tus datos están en [0,100], marca 'Valores 0-100'.")
-        with c3:
-            perc_0_to_100 = st.checkbox("Valores 0–100 (no 0–1)", value=True)
-        c4, c5, c6 = st.columns(3)
-        with c4:
-            do_norm = st.checkbox("Normalizar a base=100", value=False)
-        with c5:
-            base_idx = st.number_input("Índice base", value=0, min_value=0, step=1)
-        with c6:
-            y_log = st.checkbox("Escala log Y", value=False)
+
+        # Aplicar perfil de unidades por defecto
+        prof = st.session_state.get("units_profile", {"percent_cols": [], "percent_0_100": True, "currency_cols": [], "index_cols": []})
+        is_percent_cols = st.multiselect("Tratar como % (perfil)", ys, default=[c for c in ys if c in prof.get("percent_cols", [])])
+        perc_0_to_100 = st.checkbox("Valores 0–100 (no 0–1)", value=prof.get("percent_0_100", True))
+        idx_defaults = [c for c in ys if c in prof.get("index_cols", [])]
+        do_norm = st.checkbox("Normalizar a base=100 (para columnas marcadas como índice)", value=len(idx_defaults)>0)
+        base_idx = st.number_input("Índice base", value=0, min_value=0, step=1)
+        y_log = st.checkbox("Escala log Y", value=False)
         facet = st.checkbox("Pequeños múltiples (facet por variable)", value=False)
+        auto_dual = st.checkbox("Eje secundario automático", value=True)
+
+        # --- Diagnóstico rápido de fechas (si el eje X es fecha) ---
+        if x:
+            inv2 = invalid_date_rows(df, x)
+            if len(inv2) > 0:
+                st.caption(f"<span class='badge'>Diagnóstico</span> {len(inv2)} filas con fecha inválida en '{x}'.", unsafe_allow_html=True)
+                with st.expander("Ver y descargar filas inválidas"):
+                    st.dataframe(inv2.head(200), use_container_width=True)
+                    st.download_button("Descargar CSV inválidas (EDA)", inv2.to_csv(index=False).encode("utf-8"), "fechas_invalidas_EDA.csv")
 
         dplot = df.copy()
         for col in ys:
@@ -241,8 +295,16 @@ elif PAGE.startswith("2"):
                 dplot[col] = pd.to_numeric(dplot[col], errors="coerce")
             except Exception:
                 pass
-        if do_norm and len(ys)>0 and base_idx < len(dplot):
-            dplot = normalize_base_100(dplot, ys, base_idx=base_idx)
+
+        idx_cols = [c for c in ys if c in prof.get("index_cols", [])]
+        if do_norm and len(idx_cols)>0 and base_idx < len(dplot):
+            dplot = normalize_base_100(dplot, idx_cols, base_idx=base_idx)
+
+        # ---- Heurística de ejes: % al secundario si hay mezcla con moneda/niveles
+        on_secondary = set()
+        if auto_dual:
+            if any(c in prof.get("currency_cols", []) for c in ys) and any(c in prof.get("percent_cols", []) for c in ys):
+                on_secondary.update([c for c in ys if c in prof.get("percent_cols", [])])
 
         # ---- Graficado ----
         try:
@@ -254,28 +316,21 @@ elif PAGE.startswith("2"):
                 st.plotly_chart(fig, use_container_width=True)
             else:
                 fig = go.Figure()
-                if len(ys) >= 1:
-                    y0 = ys[0]
-                    y0_series = dplot[y0]
-                    if y0 in is_percent_cols:
-                        y0_series = to_percent_series(y0_series, assume_0_to_1=not perc_0_to_100)
-                    fig.add_trace(go.Scatter(x=dplot[x], y=y0_series, name=y0, yaxis="y1"))
-                for yname in ys[1:]:
-                    yser = dplot[yname]
-                    if yname in is_percent_cols:
+                for i, ycol in enumerate(ys):
+                    yser = dplot[ycol]
+                    if ycol in is_percent_cols:
                         yser = to_percent_series(yser, assume_0_to_1=not perc_0_to_100)
-                    fig.add_trace(go.Scatter(x=dplot[x], y=yser, name=yname, yaxis="y2" if use_dual else "y1"))
+                    sec = (ycol in on_secondary) and auto_dual
+                    fig.add_trace(go.Scatter(x=dplot[x], y=yser, name=ycol, yaxis="y2" if sec else "y1"))
                 fig.update_layout(template=template)
                 if y_log:
                     fig.update_yaxes(type="log")
-                # % formatting
                 if len(is_percent_cols)>0:
                     fig.update_yaxes(tickformat=".0%")
-                # Configure dual axis
-                if use_dual and len(ys)>1:
+                if auto_dual and len(on_secondary)>0:
                     fig.update_layout(
-                        yaxis=dict(title=ys[0]),
-                        yaxis2=dict(title="Escala secundaria", overlaying="y", side="right", showgrid=False)
+                        yaxis=dict(title="Nivel"),
+                        yaxis2=dict(title="%", overlaying="y", side="right", showgrid=False)
                     )
                 st.plotly_chart(fig, use_container_width=True)
         except Exception as e:
@@ -299,6 +354,14 @@ elif PAGE.startswith("3"):
     df=st.session_state["data"]; dc=st.session_state["date_col"]; tg=st.session_state["target"]
     if df.empty or not dc or not tg: st.info("Define fecha/objetivo en 'Cargar datos'.")
     else:
+        # Diagnóstico
+        inv3 = invalid_date_rows(df, dc)
+        if len(inv3) > 0:
+            st.caption(f"<span class='badge'>Diagnóstico</span> {len(inv3)} filas con fecha inválida en '{dc}'.", unsafe_allow_html=True)
+            with st.expander("Ver y descargar filas inválidas (Ingeniería)"):
+                st.dataframe(inv3.head(200), use_container_width=True)
+                st.download_button("Descargar CSV inválidas (Ingeniería)", inv3.to_csv(index=False).encode("utf-8"), "fechas_invalidas_ingenieria.csv")
+
         lags=st.multiselect("Lags", [1,2,3,6,9,12,18,24], default=[1,2,3,6,12])
         rolls=st.multiselect("Ventanas móviles", [3,6,12,24], default=[3,6,12])
         d=robust_to_datetime(df.copy(), dc); d=d.sort_values(dc); d=add_calendar(d,dc); d=add_lags_rolls(d,tg,lags,rolls).dropna()
