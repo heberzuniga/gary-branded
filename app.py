@@ -66,7 +66,7 @@ with st.sidebar:
     logo = st.file_uploader("Logo (opcional, PNG/JPG)", type=["png","jpg","jpeg"], key="logo_brand")
     if st.button("Aplicar estilo"):
         st.session_state["brand"].update({"org": org, "primary_hex": primary, "accent_hex": accent, "dark": dark})
-        st.experimental_rerun()
+        st.rerun()
 
     st.markdown("---")
     PAGE = st.radio("Navegación", [
