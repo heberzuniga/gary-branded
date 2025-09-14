@@ -82,6 +82,31 @@ def parse_date(df)->Optional[str]:
         except: pass
     return None
 
+def robust_to_datetime(df, col):
+    """Convert a date-like column to pandas datetime handling mixed formats."""
+    s = df[col].astype(str).str.strip()
+    dt1 = pd.to_datetime(s, errors='coerce', infer_datetime_format=True, utc=False)
+    if dt1.isna().mean() > 0.3:
+        dt2 = pd.to_datetime(s, errors='coerce', dayfirst=True, infer_datetime_format=True, utc=False)
+        dt = dt2
+        if dt.isna().mean() > 0.3:
+            s2 = s.str.replace('/', '-', regex=False)
+            dt3 = pd.to_datetime(s2, errors='coerce', infer_datetime_format=True, utc=False)
+            if dt3.isna().mean() > 0.3:
+                dt4 = pd.to_datetime(s2, errors='coerce', dayfirst=True, infer_datetime_format=True, utc=False)
+                dt = dt4
+            else:
+                dt = dt3
+    else:
+        dt = dt1
+    out = df.copy()
+    out[col] = dt
+    n_bad = int(out[col].isna().sum())
+    if n_bad > 0:
+        st.warning(f"Se detectaron {n_bad} filas con fechas inválidas en '{col}'. Serán omitidas para el análisis.")
+        out = out.loc[out[col].notna()].copy()
+    return out
+
 def add_calendar(df, date_col):
     d=df.copy(); d[date_col]=pd.to_datetime(d[date_col])
     d["year"]=d[date_col].dt.year; d["month"]=d[date_col].dt.month; d["quarter"]=d[date_col].dt.quarter; d["week"]=d[date_col].dt.isocalendar().week.astype(int)
@@ -90,8 +115,7 @@ def add_calendar(df, date_col):
 
 def add_lags_rolls(df, target, lags, rolls):
     d = df.copy()
-    # Coerción robusta del objetivo a numérico (quita símbolos, comas, espacios)
-    ser = d[target].astype(str).str.replace(r'[^0-9,\.\-]', '', regex=True).str.replace(',', '', regex=False)
+    ser = d[target].astype(str).str.replace(r'[^0-9,.\-]', '', regex=True).str.replace(',', '', regex=False)
     d[target] = pd.to_numeric(ser, errors='coerce')
     for L in lags:
         d[f"{target}_lag{L}"] = d[target].shift(L)
@@ -142,6 +166,24 @@ def walk_forward(df, date_col, target, feats, model, initial, step):
         out.append(pd.DataFrame({date_col: te[date_col].values, "y_true": yte.values, "y_pred": pred}))
     return pd.concat(out, ignore_index=True) if out else pd.DataFrame(columns=[date_col,"y_true","y_pred"])
 
+def to_percent_series(s, assume_0_to_1=True):
+    s = pd.to_numeric(s, errors="coerce")
+    if assume_0_to_1:
+        return s
+    else:
+        return s/100.0
+
+def normalize_base_100(df, cols, base_idx=0):
+    out = df.copy()
+    for c in cols:
+        try:
+            base = float(out[c].iloc[base_idx])
+            if base != 0:
+                out[c] = out[c] / base * 100.0
+        except Exception:
+            pass
+    return out
+
 # ---------- Session ----------
 for k,v in {"data":pd.DataFrame(),"date_col":"","target":"","features":[],"engineered":pd.DataFrame(),"freq":"MS","best_name":"","best_model":None}.items():
     if k not in st.session_state: st.session_state[k]=v
@@ -174,20 +216,75 @@ elif PAGE.startswith("2"):
         template=st.selectbox("Plantilla", ["plotly_white","plotly","ggplot2","seaborn","simple_white","plotly_dark","presentation"], index=0)
         st.write("Dimensiones:", df.shape); st.write("Tipos:", df.dtypes)
         with st.expander("Estadísticos"): st.write(df.describe(include="all"))
-        x=st.selectbox("Eje X", list(df.columns)); ys=st.multiselect("Ejes Y", [c for c in df.columns if c!=x], default=[c for c in df.columns if c!=x][:1])
-        kind=st.selectbox("Tipo", ["Línea","Área","Barras","Dispersión","Boxplot","Heatmap (correlación)"])
-        if ys:
-            if kind=="Línea": fig=px.line(df,x=x,y=ys,template=template)
-            elif kind=="Área": fig=px.area(df,x=x,y=ys,template=template)
-            elif kind=="Barras": fig=px.bar(df,x=x,y=ys,template=template,barmode="group")
-            elif kind=="Dispersión": fig=px.scatter(df,x=x,y=ys[0],template=template)
-            elif kind=="Boxplot": fig=px.box(df,x=x,y=ys[0],template=template)
-            else: fig=px.imshow(df.select_dtypes(include=[np.number]).corr(),template=template,color_continuous_scale="RdBu_r",origin="lower")
-            st.plotly_chart(fig, use_container_width=True)
-        # HP & STL si hay fecha y target
+        # ---- Configuración ----
+        x=st.selectbox("Eje X", list(df.columns))
+        ys=st.multiselect("Series a graficar (Y)", [c for c in df.columns if c != x], default=[c for c in df.columns if c != x][:1])
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            use_dual = st.checkbox("Eje secundario automático", value=True, help="Si las escalas difieren mucho, usa un segundo eje Y.")
+        with c2:
+            is_percent_cols = st.multiselect("Tratar como %", ys, help="Se formatean como porcentaje. Si tus datos están en [0,100], marca 'Valores 0-100'.")
+        with c3:
+            perc_0_to_100 = st.checkbox("Valores 0–100 (no 0–1)", value=True)
+        c4, c5, c6 = st.columns(3)
+        with c4:
+            do_norm = st.checkbox("Normalizar a base=100", value=False)
+        with c5:
+            base_idx = st.number_input("Índice base", value=0, min_value=0, step=1)
+        with c6:
+            y_log = st.checkbox("Escala log Y", value=False)
+        facet = st.checkbox("Pequeños múltiples (facet por variable)", value=False)
+
+        dplot = df.copy()
+        for col in ys:
+            try:
+                dplot[col] = pd.to_numeric(dplot[col], errors="coerce")
+            except Exception:
+                pass
+        if do_norm and len(ys)>0 and base_idx < len(dplot):
+            dplot = normalize_base_100(dplot, ys, base_idx=base_idx)
+
+        # ---- Graficado ----
+        try:
+            if facet and len(ys) > 1:
+                long = dplot[[x]+ys].melt(id_vars=[x], var_name="variable", value_name="valor")
+                fig = px.line(long, x=x, y="valor", facet_col="variable", facet_col_wrap=2, template=template)
+                if y_log:
+                    fig.update_yaxes(type="log")
+                st.plotly_chart(fig, use_container_width=True)
+            else:
+                fig = go.Figure()
+                if len(ys) >= 1:
+                    y0 = ys[0]
+                    y0_series = dplot[y0]
+                    if y0 in is_percent_cols:
+                        y0_series = to_percent_series(y0_series, assume_0_to_1=not perc_0_to_100)
+                    fig.add_trace(go.Scatter(x=dplot[x], y=y0_series, name=y0, yaxis="y1"))
+                for yname in ys[1:]:
+                    yser = dplot[yname]
+                    if yname in is_percent_cols:
+                        yser = to_percent_series(yser, assume_0_to_1=not perc_0_to_100)
+                    fig.add_trace(go.Scatter(x=dplot[x], y=yser, name=yname, yaxis="y2" if use_dual else "y1"))
+                fig.update_layout(template=template)
+                if y_log:
+                    fig.update_yaxes(type="log")
+                # % formatting
+                if len(is_percent_cols)>0:
+                    fig.update_yaxes(tickformat=".0%")
+                # Configure dual axis
+                if use_dual and len(ys)>1:
+                    fig.update_layout(
+                        yaxis=dict(title=ys[0]),
+                        yaxis2=dict(title="Escala secundaria", overlaying="y", side="right", showgrid=False)
+                    )
+                st.plotly_chart(fig, use_container_width=True)
+        except Exception as e:
+            st.error(f"No se pudo graficar: {e}")
+
+        # ---- HP & STL con fechas robustas ----
         dc, tg = st.session_state["date_col"], st.session_state["target"]
         if dc and tg and dc in df and tg in df:
-            s=df.copy(); s[dc]=pd.to_datetime(s[dc]); s=s.sort_values(dc).set_index(dc)
+            s = robust_to_datetime(df.copy(), dc); s = s.sort_values(dc).set_index(dc)
             lam=st.number_input("λ HP (mensual≈129,600)", value=129600, step=1000)
             try:
                 cycle,trend=hpfilter(s[tg], lamb=lam); st.plotly_chart(px.line(pd.DataFrame({"trend":trend,"cycle":cycle}), template=template, title="HP: tendencia & ciclo"), use_container_width=True)
@@ -204,15 +301,8 @@ elif PAGE.startswith("3"):
     else:
         lags=st.multiselect("Lags", [1,2,3,6,9,12,18,24], default=[1,2,3,6,12])
         rolls=st.multiselect("Ventanas móviles", [3,6,12,24], default=[3,6,12])
-        d=df.copy(); d[dc]=pd.to_datetime(d[dc]); d=d.sort_values(dc); d=add_calendar(d,dc)
-        # sanity: convertir objetivo a numérico de manera segura
-        ser = d[tg].astype(str).str.replace(r'[^0-9,\.\-]', '', regex=True).str.replace(',', '', regex=False)
-        d[tg] = pd.to_numeric(ser, errors='coerce')
-        if d[tg].notna().sum() == 0:
-            st.error("La columna objetivo no contiene valores numéricos válidos después de la conversión. Revisa la selección de objetivo o el formato (símbolos/ comas).")
-        else:
-            d = add_lags_rolls(d,tg,lags,rolls).dropna()
-            st.session_state["engineered"]=d.copy(); st.write(d.head())
+        d=robust_to_datetime(df.copy(), dc); d=d.sort_values(dc); d=add_calendar(d,dc); d=add_lags_rolls(d,tg,lags,rolls).dropna()
+        st.session_state["engineered"]=d.copy(); st.write(d.head())
         st.download_button("Descargar CSV ingenierizado", d.to_csv(index=False).encode("utf-8"), "datos_ingenierizados.csv")
 
 elif PAGE.startswith("4"):
@@ -228,8 +318,10 @@ elif PAGE.startswith("4"):
         for name,m in ms.items():
             maes,rmses,mapes=[],[],[]
             for tr,te in tscv(X,y,n):
-                m.fit(*clean_xy(X.iloc[tr], y.iloc[tr]))
-                yp=m.predict(clean_xy(X.iloc[te], y.iloc[te])[0])
+                Xtr,Ytr = clean_xy(X.iloc[tr], y.iloc[tr])
+                Xte,_ = clean_xy(X.iloc[te], y.iloc[te])
+                m.fit(Xtr,Ytr)
+                yp=m.predict(Xte)
                 met=metric_set(y.iloc[te].values, yp)
                 maes.append(met["MAE"]); rmses.append(met["RMSE"]); mapes.append(met["MAPE"])
             rows.append({"Modelo":name,"MAE":np.mean(maes),"RMSE":np.mean(rmses),"MAPE":np.mean(mapes)})
@@ -271,7 +363,7 @@ elif PAGE.startswith("6"):
         p=st.number_input("p",0,5,1); d=st.number_input("d",0,2,1); q=st.number_input("q",0,5,1); P=st.number_input("P",0,5,1); D=st.number_input("D",0,2,1); Q=st.number_input("Q",0,5,1); s=st.number_input("s (mensual=12)",0,24,12)
         if st.button("Entrenar SARIMAX"):
             try:
-                srs=df.sort_values(dc).set_index(pd.to_datetime(df[dc]))[tg].asfreq(freq).ffill()
+                tmp=robust_to_datetime(df.copy(), dc); srs=tmp.sort_values(dc).set_index(tmp[dc])[tg].asfreq(freq).ffill()
                 model=SARIMAX(srs, order=(p,d,q), seasonal_order=(P,D,Q,s), enforce_stationarity=False, enforce_invertibility=False)
                 res=model.fit(disp=False); fc=res.get_forecast(steps=h); ci=fc.conf_int(); mean=fc.predicted_mean.reset_index(); mean.columns=[dc,"sarimax"]
                 plot=mean.copy(); ci=ci.reset_index(drop=True); plot["lower"]=ci.iloc[:,0]; plot["upper"]=ci.iloc[:,1]
