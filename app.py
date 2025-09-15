@@ -71,10 +71,11 @@ with st.sidebar:
 
     data_cols = list(st.session_state.get("data", pd.DataFrame()).columns) if "data" in st.session_state else []
     if data_cols:
-        prof["percent_cols"] = st.multiselect("Columnas en % (ratios)", prof.get("percent_cols", []), default=prof.get("percent_cols", []), options=data_cols, help="Ej: stock/consumo, participación, tasas.")
+        # Correct arg order
+        prof["percent_cols"] = st.multiselect("Columnas en % (ratios)", options=data_cols, default=prof.get("percent_cols", []), help="Ej: stock/consumo, participación, tasas.")
         prof["percent_0_100"] = st.checkbox("Esquema % en 0–100 (no 0–1)", value=prof.get("percent_0_100", True))
-        prof["currency_cols"] = st.multiselect("Columnas en moneda (USD)", prof.get("currency_cols", []), default=prof.get("currency_cols", []), options=data_cols, help="Ej: precio_soya, costos en USD.")
-        prof["index_cols"] = st.multiselect("Columnas índice (base=100)", prof.get("index_cols", []), default=prof.get("index_cols", []), options=data_cols)
+        prof["currency_cols"] = st.multiselect("Columnas en moneda (USD)", options=data_cols, default=prof.get("currency_cols", []), help="Ej: precio_soya, costos en USD.")
+        prof["index_cols"] = st.multiselect("Columnas índice (base=100)", options=data_cols, default=prof.get("index_cols", []))
 
         c1, c2 = st.columns(2)
         with c1:
@@ -158,6 +159,8 @@ def add_calendar(df, date_col):
     return d
 
 def add_lags_rolls(df, target, lags, rolls):
+    if pd.api.types.is_datetime64_any_dtype(df[target]):
+        raise TypeError(f"El objetivo '{target}' es de tipo fecha. Selecciona una columna numérica.")
     d = df.copy()
     ser = d[target].astype(str).str.replace(r'[^0-9,.\-]', '', regex=True).str.replace(',', '', regex=False)
     d[target] = pd.to_numeric(ser, errors='coerce')
@@ -242,11 +245,11 @@ elif PAGE.startswith("1"):
         st.write(df.head())
         guess=parse_date(df) or ""
         date_col=st.selectbox("Columna de fecha", [""]+list(df.columns), index=(list(df.columns).index(guess)+1) if guess in df.columns else 0)
-        target=st.selectbox("Objetivo (precio)", [""]+[c for c in df.columns if c!=date_col])
+        target_options = [c for c in df.columns if not (date_col and c==date_col)]
+        target=st.selectbox("Objetivo (precio numérico)", [""]+target_options)
         feats=st.multiselect("Features (opcionales)", [c for c in df.columns if c not in [date_col,target]])
         freq=st.selectbox("Frecuencia", ["D","W","MS","M","Q","YS"], index=2)
 
-        # --- Diagnóstico & Filtro de fechas inválidas ---
         if date_col:
             inv = invalid_date_rows(df, date_col)
             n_bad = len(inv)
@@ -270,8 +273,15 @@ elif PAGE.startswith("1"):
                 st.download_button("⬇️ Descargar dataset actual (limpio)", st.session_state["data"].to_csv(index=False).encode("utf-8"), "dataset_limpio.csv")
 
         if st.button("Guardar"):
-            st.session_state.update({"date_col":date_col,"target":target,"features":feats,"freq":freq})
-            st.success("Configuración guardada.")
+            if not date_col:
+                st.error("Elige una columna de fecha válida.")
+            elif not target:
+                st.error("Elige una columna objetivo (numérica).")
+            elif pd.api.types.is_datetime64_any_dtype(df[target]):
+                st.error(f"La columna objetivo '{target}' es de tipo fecha. Selecciona una columna numérica.")
+            else:
+                st.session_state.update({"date_col":date_col,"target":target,"features":feats,"freq":freq})
+                st.success("Configuración guardada.")
 
 elif PAGE.startswith("2"):
     st.header("🔎 EDA")
@@ -285,7 +295,7 @@ elif PAGE.startswith("2"):
         ys=st.multiselect("Series a graficar (Y)", [c for c in df.columns if c != x], default=[c for c in df.columns if c != x][:1])
 
         prof = st.session_state.get("units_profile", {"percent_cols": [], "percent_0_100": True, "currency_cols": [], "index_cols": []})
-        is_percent_cols = st.multiselect("Tratar como % (perfil)", ys, default=[c for c in ys if c in prof.get("percent_cols", [])])
+        is_percent_cols = st.multiselect("Tratar como % (perfil)", options=ys, default=[c for c in ys if c in prof.get("percent_cols", [])])
         perc_0_to_100 = st.checkbox("Valores 0–100 (no 0–1)", value=prof.get("percent_0_100", True))
         idx_defaults = [c for c in ys if c in prof.get("index_cols", [])]
         do_norm = st.checkbox("Normalizar a base=100 (para columnas marcadas como índice)", value=len(idx_defaults)>0)
@@ -294,7 +304,6 @@ elif PAGE.startswith("2"):
         facet = st.checkbox("Pequeños múltiples (facet por variable)", value=False)
         auto_dual = st.checkbox("Eje secundario automático", value=True)
 
-        # Diagnóstico + filtro opcional desde EDA
         if x:
             inv2 = invalid_date_rows(df, x)
             if len(inv2) > 0:
@@ -355,7 +364,7 @@ elif PAGE.startswith("2"):
             st.error(f"No se pudo graficar: {e}")
 
         dc, tg = st.session_state["date_col"], st.session_state["target"]
-        if dc and tg and dc in df and tg in df:
+        if dc and tg and dc in df and tg in df and not pd.api.types.is_datetime64_any_dtype(df[tg]):
             s = robust_to_datetime(df.copy(), dc); s = s.sort_values(dc).set_index(dc)
             lam=st.number_input("λ HP (mensual≈129,600)", value=129600, step=1000)
             try:
@@ -365,6 +374,8 @@ elif PAGE.startswith("2"):
                 stl=STL(s[tg], period=12).fit()
                 st.plotly_chart(px.line(pd.DataFrame({"observed":s[tg],"trend":stl.trend,"seasonal":stl.seasonal,"resid":stl.resid}), template=template, title="STL"), use_container_width=True)
             except Exception as e: st.info(f"STL no disponible: {e}")
+        elif dc and tg and tg in df and pd.api.types.is_datetime64_any_dtype(df[tg]):
+            st.warning(f"El objetivo '{tg}' es fecha: los descomponedores (HP/STL) requieren serie numérica.")
 
 elif PAGE.startswith("3"):
     st.header("🧪 Ingeniería")
@@ -386,34 +397,42 @@ elif PAGE.startswith("3"):
 
         lags=st.multiselect("Lags", [1,2,3,6,9,12,18,24], default=[1,2,3,6,12])
         rolls=st.multiselect("Ventanas móviles", [3,6,12,24], default=[3,6,12])
-        d=robust_to_datetime(df.copy(), dc); d=d.sort_values(dc); d=add_calendar(d,dc); d=add_lags_rolls(d,tg,lags,rolls).dropna()
-        st.session_state["engineered"]=d.copy(); st.write(d.head())
-        st.download_button("Descargar CSV ingenierizado", d.to_csv(index=False).encode("utf-8"), "datos_ingenierizados.csv")
+        try:
+            d=robust_to_datetime(df.copy(), dc); d=d.sort_values(dc); d=add_calendar(d,dc); d=add_lags_rolls(d,tg,lags,rolls).dropna()
+            st.session_state["engineered"]=d.copy(); st.write(d.head())
+            st.download_button("Descargar CSV ingenierizado", d.to_csv(index=False).encode("utf-8"), "datos_ingenierizados.csv")
+        except TypeError as te:
+            st.error(str(te))
+        except Exception as e:
+            st.error(f"No se pudo construir lags/rolling: {e}")
 
 elif PAGE.startswith("4"):
     st.header("🤖 Modelos (TimeSeriesSplit)")
     df=st.session_state["engineered"]; dc=st.session_state["date_col"]; tg=st.session_state["target"]
     if df.empty: st.info("Realiza ingeniería primero.")
     else:
-        feats_all=[c for c in df.columns if c not in [dc,tg] and pd.api.types.is_numeric_dtype(df[c])]
-        feats=st.multiselect("Predictores", feats_all, default=[c for c in feats_all if ("lag" in c) or ("roll" in c) or (c in ["year","month","quarter","week"])])
-        n=st.slider("Folds",3,8,5,1); template=st.selectbox("Plantilla", ["plotly_white","plotly","ggplot2","seaborn","simple_white","plotly_dark","presentation"], index=0)
-        X,y=df[feats], df[tg]; ms=models()
-        rows=[]
-        for name,m in ms.items():
-            maes,rmses,mapes=[],[],[]
-            for tr,te in tscv(X,y,n):
-                Xtr,Ytr = clean_xy(X.iloc[tr], y.iloc[tr])
-                Xte,_ = clean_xy(X.iloc[te], y.iloc[te])
-                m.fit(Xtr,Ytr)
-                yp=m.predict(Xte)
-                met=metric_set(y.iloc[te].values, yp)
-                maes.append(met["MAE"]); rmses.append(met["RMSE"]); mapes.append(met["MAPE"])
-            rows.append({"Modelo":name,"MAE":np.mean(maes),"RMSE":np.mean(rmses),"MAPE":np.mean(mapes)})
-        res=pd.DataFrame(rows).sort_values("MAPE")
-        st.dataframe(res, use_container_width=True); st.plotly_chart(px.bar(res,x="Modelo",y="MAPE",template=template,title="MAPE (TS-CV)"), use_container_width=True)
-        best=res.iloc[0]["Modelo"]; st.session_state["best_name"]=best; st.session_state["best_model"]=ms[best].fit(*clean_xy(X, y))
-        st.success(f"Mejor modelo: {best} (entrenado full data).")
+        if pd.api.types.is_datetime64_any_dtype(df[tg]):
+            st.error(f"El objetivo '{tg}' es fecha. Selecciona un objetivo numérico en 'Cargar datos'.")
+        else:
+            feats_all=[c for c in df.columns if c not in [dc,tg] and pd.api.types.is_numeric_dtype(df[c])]
+            feats=st.multiselect("Predictores", feats_all, default=[c for c in feats_all if ("lag" in c) or ("roll" in c) or (c in ["year","month","quarter","week"])])
+            n=st.slider("Folds",3,8,5,1); template=st.selectbox("Plantilla", ["plotly_white","plotly","ggplot2","seaborn","simple_white","plotly_dark","presentation"], index=0)
+            X,y=df[feats], df[tg]; ms=models()
+            rows=[]
+            for name,m in ms.items():
+                maes,rmses,mapes=[],[],[]
+                for tr,te in tscv(X,y,n):
+                    Xtr,Ytr = clean_xy(X.iloc[tr], y.iloc[tr])
+                    Xte,_ = clean_xy(X.iloc[te], y.iloc[te])
+                    m.fit(Xtr,Ytr)
+                    yp=m.predict(Xte)
+                    met=metric_set(y.iloc[te].values, yp)
+                    maes.append(met["MAE"]); rmses.append(met["RMSE"]); mapes.append(met["MAPE"])
+                rows.append({"Modelo":name,"MAE":np.mean(maes),"RMSE":np.mean(rmses),"MAPE":np.mean(mapes)})
+            res=pd.DataFrame(rows).sort_values("MAPE")
+            st.dataframe(res, use_container_width=True); st.plotly_chart(px.bar(res,x="Modelo",y="MAPE",template=template,title="MAPE (TS-CV)"), use_container_width=True)
+            best=res.iloc[0]["Modelo"]; st.session_state["best_name"]=best; st.session_state["best_model"]=ms[best].fit(*clean_xy(X, y))
+            st.success(f"Mejor modelo: {best} (entrenado full data).")
 
 elif PAGE.startswith("5"):
     st.header("🚶 Walk-Forward")
@@ -481,18 +500,20 @@ elif PAGE.startswith("8"):
 elif PAGE.startswith("9"):
     st.header("📝 Reporte")
     now=datetime.now().strftime("%Y-%m-%d %H:%M")
-    summary={"fecha":now,"org":st.session_state["brand"]["org"],"mejor_modelo":st.session_state.get("best_name",""),"freq":st.session_state.get("freq","MS"),"date_col":st.session_state.get("date_col",""),"target":st.session_state.get("target",""),"features":st.session_state.get("features",[])}
+    summary={"fecha":now,"org":st.session_state["brand"]["org"]}
+    for key in ["best_name","freq","date_col","target","features"]:
+        summary[key]=st.session_state.get(key,"")
     st.json(summary)
     comments=st.text_area("Comentarios (opcional)")
     md=f"""# Reporte — {summary['org']}
 **Fecha:** {now}
 
 ## Configuración
-- Mejor modelo: {summary['mejor_modelo']}
-- Frecuencia: {summary['freq']}
-- Columna de fecha: {summary['date_col']}
-- Objetivo: {summary['target']}
-- Features base: {', '.join(summary['features'])}
+- Mejor modelo: {summary.get('best_name','')}
+- Frecuencia: {summary.get('freq','MS')}
+- Columna de fecha: {summary.get('date_col','')}
+- Objetivo: {summary.get('target','')}
+- Features base: {', '.join(summary.get('features', []))}
 
 ## Comentarios
 {comments}

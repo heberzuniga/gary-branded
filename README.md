@@ -1,10 +1,9 @@
-# Soya ML — UPSA | SolverTic (v3 Auto-Filter)
+# Soya ML — UPSA | SolverTic (v3.1 Patch)
 
-Novedad principal: botón **🧹 Filtrar dataset** que excluye en un clic las filas con fechas inválidas,
-actualiza el dataset en memoria y expone descargas tanto del dataset limpio como del descarte.
+- FIX de `st.multiselect` (orden de argumentos).
+- Validaciones para impedir seleccionar columna de **fecha** como objetivo.
+- Botón 🧹 para filtrar filas con fechas inválidas y descargas de dataset limpio/descartes.
 
-Disponible en: Cargar datos, EDA e Ingeniería.
-
-Uso local:
+Uso:
 pip install -r requirements.txt
 streamlit run app.py
