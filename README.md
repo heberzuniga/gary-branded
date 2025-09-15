@@ -1,9 +1,9 @@
-# Soya ML — UPSA | SolverTic (Perfil + Diagnóstico de Fechas)
+# Soya ML — UPSA | SolverTic (v3 Auto-Filter)
 
-Novedades:
-- Visor y descarga de filas con fechas inválidas en: Cargar datos, EDA e Ingeniería.
-- Mantiene perfil de unidades (% / USD / índice) y ejes automáticos.
-- Parser de fechas robusto aplicado en todo el flujo.
+Novedad principal: botón **🧹 Filtrar dataset** que excluye en un clic las filas con fechas inválidas,
+actualiza el dataset en memoria y expone descargas tanto del dataset limpio como del descarte.
+
+Disponible en: Cargar datos, EDA e Ingeniería.
 
 Uso local:
 pip install -r requirements.txt

@@ -69,7 +69,6 @@ with st.sidebar:
         st.session_state["units_profile"] = {"percent_cols": [], "percent_0_100": True, "currency_cols": [], "index_cols": []}
     prof = st.session_state["units_profile"]
 
-    # Los selects se habilitan cuando hay datos cargados
     data_cols = list(st.session_state.get("data", pd.DataFrame()).columns) if "data" in st.session_state else []
     if data_cols:
         prof["percent_cols"] = st.multiselect("Columnas en % (ratios)", prof.get("percent_cols", []), default=prof.get("percent_cols", []), options=data_cols, help="Ej: stock/consumo, participación, tasas.")
@@ -138,15 +137,19 @@ def robust_to_datetime(df, col):
     return out
 
 def invalid_date_rows(df, col):
-    """Return rows whose date in `col` stays NaT after robust parsing, plus the original value for inspection."""
     orig = df.copy()
     parsed = robust_to_datetime(df, col)
     bad_mask = parsed[col].isna()
     bad = orig.loc[bad_mask, [col]].copy()
     bad.columns = [f"{col}_original"]
-    # add row index for reference
     bad = bad.reset_index().rename(columns={"index": "row_idx"})
     return bad
+
+def filter_dataset_by_valid_dates(df, col):
+    parsed = robust_to_datetime(df, col)
+    good = parsed.loc[parsed[col].notna()].copy()
+    bad = df.loc[parsed[col].isna()].copy()
+    return good, bad
 
 def add_calendar(df, date_col):
     d=df.copy(); d[date_col]=pd.to_datetime(d[date_col])
@@ -243,15 +246,28 @@ elif PAGE.startswith("1"):
         feats=st.multiselect("Features (opcionales)", [c for c in df.columns if c not in [date_col,target]])
         freq=st.selectbox("Frecuencia", ["D","W","MS","M","Q","YS"], index=2)
 
-        # --- Diagnóstico de fechas inválidas ---
+        # --- Diagnóstico & Filtro de fechas inválidas ---
         if date_col:
             inv = invalid_date_rows(df, date_col)
             n_bad = len(inv)
             if n_bad > 0:
                 st.warning(f"Se detectaron {n_bad} filas con fechas inválidas en '{date_col}'.")
                 with st.expander("Ver filas con fecha inválida"):
-                    st.dataframe(inv.head(200), use_container_width=True)
+                    st.dataframe(inv.head(300), use_container_width=True)
                     st.download_button("Descargar CSV con filas inválidas", inv.to_csv(index=False).encode("utf-8"), "fechas_invalidas.csv")
+                c1, c2 = st.columns(2)
+                with c1:
+                    if st.button("🧹 Filtrar dataset (excluir inválidas)"):
+                        good, bad = filter_dataset_by_valid_dates(df, date_col)
+                        st.session_state["data"] = good
+                        st.session_state["last_clean_bad"] = bad
+                        st.success(f"Se filtró el dataset. Filas válidas: {len(good)} · Removidas: {len(bad)}")
+                        st.rerun()
+                with c2:
+                    if "last_clean_bad" in st.session_state and isinstance(st.session_state["last_clean_bad"], pd.DataFrame) and not st.session_state["last_clean_bad"].empty:
+                        st.download_button("Descargar último descarte (CSV)", st.session_state["last_clean_bad"].to_csv(index=False).encode("utf-8"), "filas_descartadas.csv")
+            if not st.session_state["data"].empty:
+                st.download_button("⬇️ Descargar dataset actual (limpio)", st.session_state["data"].to_csv(index=False).encode("utf-8"), "dataset_limpio.csv")
 
         if st.button("Guardar"):
             st.session_state.update({"date_col":date_col,"target":target,"features":feats,"freq":freq})
@@ -265,11 +281,9 @@ elif PAGE.startswith("2"):
         template=st.selectbox("Plantilla", ["plotly_white","plotly","ggplot2","seaborn","simple_white","plotly_dark","presentation"], index=0)
         st.write("Dimensiones:", df.shape); st.write("Tipos:", df.dtypes)
         with st.expander("Estadísticos"): st.write(df.describe(include="all"))
-        # ---- Configuración ----
         x=st.selectbox("Eje X", list(df.columns))
         ys=st.multiselect("Series a graficar (Y)", [c for c in df.columns if c != x], default=[c for c in df.columns if c != x][:1])
 
-        # Aplicar perfil de unidades por defecto
         prof = st.session_state.get("units_profile", {"percent_cols": [], "percent_0_100": True, "currency_cols": [], "index_cols": []})
         is_percent_cols = st.multiselect("Tratar como % (perfil)", ys, default=[c for c in ys if c in prof.get("percent_cols", [])])
         perc_0_to_100 = st.checkbox("Valores 0–100 (no 0–1)", value=prof.get("percent_0_100", True))
@@ -280,14 +294,20 @@ elif PAGE.startswith("2"):
         facet = st.checkbox("Pequeños múltiples (facet por variable)", value=False)
         auto_dual = st.checkbox("Eje secundario automático", value=True)
 
-        # --- Diagnóstico rápido de fechas (si el eje X es fecha) ---
+        # Diagnóstico + filtro opcional desde EDA
         if x:
             inv2 = invalid_date_rows(df, x)
             if len(inv2) > 0:
                 st.caption(f"<span class='badge'>Diagnóstico</span> {len(inv2)} filas con fecha inválida en '{x}'.", unsafe_allow_html=True)
-                with st.expander("Ver y descargar filas inválidas"):
-                    st.dataframe(inv2.head(200), use_container_width=True)
+                with st.expander("Ver/descargar inválidas (EDA)"):
+                    st.dataframe(inv2.head(300), use_container_width=True)
                     st.download_button("Descargar CSV inválidas (EDA)", inv2.to_csv(index=False).encode("utf-8"), "fechas_invalidas_EDA.csv")
+                if st.button("🧹 Filtrar dataset ahora (EDA)"):
+                    good, bad = filter_dataset_by_valid_dates(df, x)
+                    st.session_state["data"] = good
+                    st.session_state["last_clean_bad"] = bad
+                    st.success(f"Dataset filtrado desde EDA. Filas válidas: {len(good)} · Removidas: {len(bad)}")
+                    st.rerun()
 
         dplot = df.copy()
         for col in ys:
@@ -300,13 +320,11 @@ elif PAGE.startswith("2"):
         if do_norm and len(idx_cols)>0 and base_idx < len(dplot):
             dplot = normalize_base_100(dplot, idx_cols, base_idx=base_idx)
 
-        # ---- Heurística de ejes: % al secundario si hay mezcla con moneda/niveles
         on_secondary = set()
         if auto_dual:
             if any(c in prof.get("currency_cols", []) for c in ys) and any(c in prof.get("percent_cols", []) for c in ys):
                 on_secondary.update([c for c in ys if c in prof.get("percent_cols", [])])
 
-        # ---- Graficado ----
         try:
             if facet and len(ys) > 1:
                 long = dplot[[x]+ys].melt(id_vars=[x], var_name="variable", value_name="valor")
@@ -336,7 +354,6 @@ elif PAGE.startswith("2"):
         except Exception as e:
             st.error(f"No se pudo graficar: {e}")
 
-        # ---- HP & STL con fechas robustas ----
         dc, tg = st.session_state["date_col"], st.session_state["target"]
         if dc and tg and dc in df and tg in df:
             s = robust_to_datetime(df.copy(), dc); s = s.sort_values(dc).set_index(dc)
@@ -354,13 +371,18 @@ elif PAGE.startswith("3"):
     df=st.session_state["data"]; dc=st.session_state["date_col"]; tg=st.session_state["target"]
     if df.empty or not dc or not tg: st.info("Define fecha/objetivo en 'Cargar datos'.")
     else:
-        # Diagnóstico
         inv3 = invalid_date_rows(df, dc)
         if len(inv3) > 0:
             st.caption(f"<span class='badge'>Diagnóstico</span> {len(inv3)} filas con fecha inválida en '{dc}'.", unsafe_allow_html=True)
-            with st.expander("Ver y descargar filas inválidas (Ingeniería)"):
-                st.dataframe(inv3.head(200), use_container_width=True)
+            with st.expander("Ver/descargar inválidas (Ingeniería)"):
+                st.dataframe(inv3.head(300), use_container_width=True)
                 st.download_button("Descargar CSV inválidas (Ingeniería)", inv3.to_csv(index=False).encode("utf-8"), "fechas_invalidas_ingenieria.csv")
+            if st.button("🧹 Filtrar dataset ahora (Ingeniería)"):
+                good, bad = filter_dataset_by_valid_dates(df, dc)
+                st.session_state["data"] = good
+                st.session_state["last_clean_bad"] = bad
+                st.success(f"Dataset filtrado desde Ingeniería. Filas válidas: {len(good)} · Removidas: {len(bad)}")
+                st.rerun()
 
         lags=st.multiselect("Lags", [1,2,3,6,9,12,18,24], default=[1,2,3,6,12])
         rolls=st.multiselect("Ventanas móviles", [3,6,12,24], default=[3,6,12])
